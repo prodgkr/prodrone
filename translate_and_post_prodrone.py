@@ -83,7 +83,11 @@ PRODRONE_SITE_URL = "https://prodrone.kr"
 # production site, so a preview-branch deployment can be verified.
 # Default is PRODRONE_SITE_URL — identical behaviour when unset.
 DEPLOY_VERIFY_BASE_URL = os.environ.get("DEPLOY_VERIFY_BASE_URL", PRODRONE_SITE_URL).strip() or PRODRONE_SITE_URL
-DEPLOY_VERIFY_TIMEOUT = 600   # 초 (Cloudflare Pages 빌드·배포 지연 감안)
+# M-2 (option B): 600 -> 1500 s, temporary for the first week after merge.
+# 10-article runs push once per article and the free plan builds one at a
+# time, so the last post can go live well after last-push + 600 s. Tune
+# from real build data (Pages deployments list) after the first runs.
+DEPLOY_VERIFY_TIMEOUT = 1500  # 초 (Cloudflare Pages 빌드·배포 지연 감안)
 DEPLOY_VERIFY_INTERVAL = 30   # 초
 
 
@@ -334,8 +338,10 @@ class NewsTranslator:
         # 수집 소스 상태 (§3-3: 소스 전부 실패 시 런 실패 처리용)
         self._rss_ok = True
         self._archive_ok = True
-        # C1: 이번 런에 새로 발행한 글의 슬러그 (배포 검증용)
-        self.new_post_slugs = []
+        # C1: 이번 런에 새로 발행한 글의 (슬러그, front matter 제목) (배포 검증용)
+        # M-3: 제목도 함께 모아둔다 — 같은 슬러그를 덮어쓴 경우 구버전도
+        # HTTP 200을 반환하므로, 제목이 나타나는지까지 확인해야 한다.
+        self.new_posts = []
 
     def scan_published_sources(self) -> set:
         """content/posts/*.md front matter에서 source_url을 수집한다. (§3-4 2단계)"""
@@ -425,6 +431,18 @@ class NewsTranslator:
     def save_posted_articles(self):
         with open(POSTED_ARTICLES_FILE, 'w') as f:
             json.dump(self.posted_articles, f, indent=2)
+
+    def _record_posted(self, url: str):
+        """posted JSON에 원문 URL을 기록한다 (M-1).
+        프리뷰 모드(HUGO_TARGET_BRANCH != "main")에서는 main의 posted 목록을
+        오염시키지 않도록 기록하지 않는다 — 프리뷰로만 발행한 기사가 라이브에
+        영원히 안 뜨는 것을 막는다. 워크플로의 posted 커밋 단계는 변경이
+        없으면 커밋을 만들지 않으므로, 프리뷰 디스패치에서는 사실상 no-op이다."""
+        if HUGO_TARGET_BRANCH != "main":
+            print("preview 모드: posted 기록 안 함")
+            return
+        self.posted_articles.append(url)
+        self.save_posted_articles()
 
     @staticmethod
     def _fm_text(s: str) -> str:
@@ -526,6 +544,11 @@ draft: false
             if result.returncode != 0:
                 subprocess.run(["git", "-C", str(HUGO_REPO_LOCAL), "commit", "-m",
                     f"post: {title[:50]} [{article_date.strftime('%Y-%m-%d')}]"], check=True)
+                # m-1: push 전에 pull --rebase — 실행 중 원격이 전진했으면
+                # push가 거부되고, 로컬에 남은 미푸시 커밋 때문에 이후 기사도
+                # 전부 push가 거부된다. 같은 타깃 브랜치 기준으로 따라잡는다.
+                subprocess.run(["git", "-C", str(HUGO_REPO_LOCAL), "pull", "--rebase",
+                                "origin", HUGO_TARGET_BRANCH], check=True)
                 # Push target is explicit: a bare `git push` would follow the
                 # checked-out branch's upstream, which is wrong if the local
                 # dir was ever on another branch. Name the target branch.
@@ -605,6 +628,7 @@ draft: false
         collected = []
         seen_links = set()
         pages_ok = 0
+        total_found = 0  # m-3: 발견 건수 합계 (페이지 HTTP 성공이 아닌 발견 건수로 판정)
         page = actual_max_page if oldest_first else 1
 
         while len(collected) < need * 3 and 1 <= page <= ARCHIVE_MAX_PAGES:
@@ -666,6 +690,7 @@ draft: false
                                 found.append({'title': title, 'link': href,
                                               'date': datetime.now(), 'source': 'archive'})
 
+                total_found += len(found)
                 for art in found:
                     if art['link'] not in seen_links:
                         seen_links.add(art['link'])
@@ -682,8 +707,9 @@ draft: false
 
         collected.sort(key=lambda x: x['date'], reverse=not oldest_first)
         result = collected[:need]
-        print(f"   아카이브 수집 완료: {len(result)}건")
-        self._archive_ok = pages_ok > 0
+        print(f"   아카이브 수집 완료: {len(result)}건 (발견 합계 {total_found}건)")
+        # m-3: 성공 기준은 "발견 건수 합계 > 0" — HTTP 200만으로는 구조 변경을 못 잡는다.
+        self._archive_ok = total_found > 0
         return result
 
     def get_articles_to_process(self):
@@ -1002,8 +1028,7 @@ draft: false
         # §3-4: 2단계 중복 검사 (posted JSON + MD source_url)
         if self.is_already_published(article['link']):
             if article['link'] not in self.posted_articles:
-                self.posted_articles.append(article['link'])
-                self.save_posted_articles()
+                self._record_posted(article['link'])
             print("⏭️  이미 게시됨 → 스킵")
             return "duplicate"
 
@@ -1126,14 +1151,15 @@ draft: false
         final_slug = self.publish_to_hugo(title_ko, final_content, slug, excerpt,
                                 article['date'], local_img, source_url=article['link'])
         if final_slug:
-            # C1: 이번 런에 발행한 슬러그를 모아 런 종료 시 라이브 URL을 검증한다.
-            self.new_post_slugs.append(final_slug)
+            # C1: 이번 런에 발행한 (슬러그, front matter 제목)을 모아 런 종료 시
+            # 라이브 URL을 검증한다. 제목은 publish_to_hugo가 front matter에
+            # 쓴 것과 같은 값(_fm_text)이다 (M-3).
+            self.new_posts.append((final_slug, self._fm_text(title_ko)))
             if local_img:
                 try: local_img.unlink()
                 except: pass
             if not FORCE_UPDATE:
-                self.posted_articles.append(article['link'])
-                self.save_posted_articles()
+                self._record_posted(article['link'])
                 self.published_sources.add(article['link'])
             return "published"
         return "failed"
@@ -1167,7 +1193,7 @@ draft: false
             print("✅ 처리할 기사 없음 (신규 기사 없음 — 정상 종료)")
             return 0
 
-        self.new_post_slugs = []
+        self.new_posts = []
         counts = {"published": 0, "duplicate": 0, "failed": 0}
         try:
             for i, article in enumerate(articles, 1):
@@ -1198,7 +1224,7 @@ draft: false
 
         # C1: 배포 검증 — 이번 런에 새로 발행한 글의 라이브 URL이 HTTP 200인지 확인한다.
         # push는 기사마다 이미 끝났고, Pages 빌드·배포 지연을 감안해 시간 창 안에서 재시도한다.
-        if self.new_post_slugs:
+        if self.new_posts:
             if not self.verify_deployment():
                 print("❌ 배포 검증 실패 → 런 실패 처리")
                 return 1
@@ -1207,35 +1233,48 @@ draft: false
         if counts["failed"] > 0 and counts["published"] == 0:
             print(f"❌ 실제 실패 {counts['failed']}건, 게시 0건 → 런 실패 처리")
             return 1
+        # m-1: 실패가 3건 이상이면 일부가 게시됐어도 런 실패 처리한다.
+        # (푸시 충돌 등으로 뒤쪽 기사가 조용히 실패하는 경우를 못 잡기 때문)
+        if counts["failed"] >= 3:
+            print(f"❌ 실패 {counts['failed']}건 (3건 이상) → 런 실패 처리")
+            return 1
         return 0
 
     def verify_deployment(self) -> bool:
         """C1: 이번 런에 새로 발행한 글의 라이브 URL이 HTTP 200인지 확인한다.
         Cloudflare Pages 빌드·배포 지연을 감안해 DEPLOY_VERIFY_TIMEOUT까지 재시도한다.
-        하나라도 200이 아니면 False를 반환한다."""
-        urls = [f"{DEPLOY_VERIFY_BASE_URL}/posts/{slug}/" for slug in self.new_post_slugs]
-        print(f"🔍 배포 검증: {len(urls)}건 (최대 {DEPLOY_VERIFY_TIMEOUT}초 대기)")
+        하나라도 200이 아니면 False를 반환한다.
+        M-3: 200만으로는 부족하다 — 같은 슬러그를 덮어쓴 경우 구버전도 200을
+        반환한다. 그래서 응답 본문에 해당 글의 front matter 제목이 들어있는지까지
+        확인하고, 제목이 나타날 때까지 폴링한다."""
+        import html as _html
+        posts = [(f"{DEPLOY_VERIFY_BASE_URL}/posts/{slug}/", title)
+                 for slug, title in self.new_posts]
+        print(f"🔍 배포 검증: {len(posts)}건 (최대 {DEPLOY_VERIFY_TIMEOUT}초 대기)")
         deadline = time.time() + DEPLOY_VERIFY_TIMEOUT
-        pending = list(urls)
+        pending = list(posts)
         while pending:
             remaining = []
-            for url in pending:
+            for url, title in pending:
                 try:
                     res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                    if res.status_code == 200:
-                        print(f"   ✅ 배포 검증 통과 (HTTP 200): {url}")
+                    if res.status_code == 200 and title in _html.unescape(res.text):
+                        print(f"   ✅ 배포 검증 통과 (HTTP 200 + 제목 확인): {url}")
                     else:
-                        print(f"   ⏳ 배포 검증 대기 (HTTP {res.status_code}): {url}")
-                        remaining.append(url)
+                        if res.status_code == 200:
+                            print(f"   ⏳ 배포 검증 대기 (200이나 새 제목 미반영): {url}")
+                        else:
+                            print(f"   ⏳ 배포 검증 대기 (HTTP {res.status_code}): {url}")
+                        remaining.append((url, title))
                 except Exception as e:
                     print(f"   ⏳ 배포 검증 대기 (오류): {url} — {e}")
-                    remaining.append(url)
+                    remaining.append((url, title))
             pending = remaining
             if not pending:
                 return True
             if time.time() >= deadline:
-                for url in pending:
-                    print(f"   ❌ 배포 검증 실패 ({DEPLOY_VERIFY_TIMEOUT}초 내 200 없음): {url}")
+                for url, _title in pending:
+                    print(f"   ❌ 배포 검증 실패 ({DEPLOY_VERIFY_TIMEOUT}초 내 200+제목 없음): {url}")
                 return False
             time.sleep(DEPLOY_VERIFY_INTERVAL)
         return True
@@ -1252,6 +1291,14 @@ def main() -> int:
         print("❌ 설정 오류: hugo_target_branch가 main이 아닌데 "
               "DEPLOY_VERIFY_BASE_URL이 라이브 사이트(https://prodrone.kr)입니다.")
         print("   프리뷰 브랜치는 프리뷰 URL(예: https://v8-preview.prodrone-54v.pages.dev)로 검증해야 합니다.")
+        return 1
+    # m-2: 역방향도 막는다. 브랜치가 main인데 검증 URL이 라이브가 아니면
+    # 라이브에 푸시하고 프리뷰에서 검증하게 돼, 글이 없어서 거짓 exit 1이 난다.
+    if (HUGO_TARGET_BRANCH == "main"
+            and DEPLOY_VERIFY_BASE_URL.strip().rstrip("/") != PRODRONE_SITE_URL):
+        print("❌ 설정 오류: hugo_target_branch가 main인데 "
+              "DEPLOY_VERIFY_BASE_URL이 라이브 사이트(https://prodrone.kr)가 아닙니다.")
+        print("   main 브랜치는 라이브 URL(https://prodrone.kr)로 검증해야 합니다.")
         return 1
     bot = NewsTranslator()
     return bot.run()

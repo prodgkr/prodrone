@@ -90,6 +90,10 @@ class TestTranslationFidelityRules(unittest.TestCase):
             '단독 "국내" 금지',
             "\u56fd\u7523\u2192\"\uc77c\ubcf8\uc0b0\"",
             "\u6771\u4eac\u2192\ub3c4\ucfc4",
+            "\u56fd\u5185\u5916\u2192\"\uc77c\ubcf8 \ub0b4\uc678\"",
+            "\u5168\u56fd/\u5168\u56fd\u5404\u5730\u2192\"\uc77c\ubcf8 \uc804\uc5ed\"",
+            "모든 출력 필드",
+            "title, excerpt, tldr, content",
         ):
             self.assertIn(required, prompt, f"missing from prompt: {required}")
 
@@ -105,7 +109,7 @@ class TestTranslationFidelityRules(unittest.TestCase):
         out = self.engine.retranslate_content("日本語の部分が残っている。国内初の飛行。")
         self.assertEqual(out, CANNED_JSON)
         prompt = self.captured_prompts[0]
-        for required in ("日本→일본", "日本語→일본어", "日本市場→일본 시장", "\u56fd\u5185\u2192\"\uc77c\ubcf8 \ub0b4\"", "円→엔", "\u56fd\u7523\u2192\"\uc77c\ubcf8\uc0b0\"", "\u6771\u4eac\u2192\ub3c4\ucfc4"):
+        for required in ("日本→일본", "日本語→일본어", "日本市場→일본 시장", "\u56fd\u5185\u2192\"\uc77c\ubcf8 \ub0b4\"", "円→엔", "\u56fd\u7523\u2192\"\uc77c\ubcf8\uc0b0\"", "\u6771\u4eac\u2192\ub3c4\ucfc4", "\u56fd\u5185\u5916\u2192\"\uc77c\ubcf8 \ub0b4\uc678\"", "\u5168\u56fd\u2192\"\uc77c\ubcf8 \uc804\uc5ed\"", "모든 출력 필드"):
             self.assertIn(required, prompt, f"missing from retranslate prompt: {required}")
 
     def test_edit_article_prompt_option_a_general_outlook_only(self):
@@ -147,6 +151,55 @@ class TestTranslationFidelityRules(unittest.TestCase):
             "한국 규제·정책 환경과의 연관성",
         ):
             self.assertNotIn(forbidden, prompt, f"must be gone from edit prompt: {forbidden}")
+
+    def test_expand_thin_content_prompt_has_fidelity_guard(self):
+        """Claude review item 1: thin-content expansion must not invent
+        Korean facts, and background must be general or from the source."""
+        out = self.engine.expand_thin_content("테스트 제목", "테스트 본문이다.")
+        self.assertEqual(out, CANNED_JSON)
+        prompt = self.captured_prompts[0]
+        for required in (
+            "원문에 근거하거나 일반적인 내용만",
+            "만들어내지 말 것",
+            "원문에 없는 한국 기관의 사업",
+            "\u56fd\u5185\u2192\"\uc77c\ubcf8 \ub0b4\"",
+            "\u56fd\u7523\u2192\"\uc77c\ubcf8\uc0b0\"",
+            "\u56fd\u5185\u5916\u2192\"\uc77c\ubcf8 \ub0b4\uc678\"",
+            "\u5168\u56fd\u2192\"\uc77c\ubcf8 \uc804\uc5ed\"",
+        ):
+            self.assertIn(required, prompt, f"missing from expand prompt: {required}")
+
+    def test_edit_article_prompt_keeps_body_fidelity(self):
+        """Claude review item 2: the edit step must not re-localize Japan
+        to Korea in the body (title/content/excerpt)."""
+        canned_edit = json.dumps(
+            {
+                "title": "테스트 제목",
+                "content": "## 소제목\n\n테스트 본문이다.",
+                "excerpt": "테스트 요약문이다.",
+                "editor_note": "## 한국 시장 전망\n\n일반적 전망만 제시한다.",
+            },
+            ensure_ascii=False,
+        )
+        self.captured_prompts.clear()
+
+        def fake_call_api_edit(_self, prompt, max_tokens=8192, response_mime_type=None):
+            self.captured_prompts.append(prompt)
+            return canned_edit
+
+        with mock.patch.object(tpp.GeminiEngine, "_call_api", fake_call_api_edit):
+            self.engine.edit_article("테스트 제목", "테스트 본문이다.", "테스트 요약문이다.")
+        self.assertEqual(len(self.captured_prompts), 1)
+        prompt = self.captured_prompts[0]
+        for required in (
+            "본문 국가·지명 표기 유지",
+            "다시 현지화하지 말 것",
+            "\u56fd\u5185\u2192\"\uc77c\ubcf8 \ub0b4\"",
+            "\u56fd\u7523\u2192\"\uc77c\ubcf8\uc0b0\"",
+            "\u56fd\u5185\u5916\u2192\"\uc77c\ubcf8 \ub0b4\uc678\"",
+            "\u5168\u56fd\u2192\"\uc77c\ubcf8 \uc804\uc5ed\"",
+        ):
+            self.assertIn(required, prompt, f"missing from edit prompt: {required}")
 
 
 if __name__ == "__main__":

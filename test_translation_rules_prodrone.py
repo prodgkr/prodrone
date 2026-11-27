@@ -108,6 +108,46 @@ class TestTranslationFidelityRules(unittest.TestCase):
         for required in ("日本→일본", "日本語→일본어", "日本市場→일본 시장", "\u56fd\u5185\u2192\"\uc77c\ubcf8 \ub0b4\"", "円→엔", "\u56fd\u7523\u2192\"\uc77c\ubcf8\uc0b0\"", "\u6771\u4eac\u2192\ub3c4\ucfc4"):
             self.assertIn(required, prompt, f"missing from retranslate prompt: {required}")
 
+    def test_edit_article_prompt_option_a_general_outlook_only(self):
+        """Option A: the Korea section is a general outlook only.
+
+        Source facts stay Japanese and are labeled as such; no specific
+        Korean-agency cases, no Korean figures, no 'already tried in Korea'
+        claims. The old example sentence must be gone.
+        """
+        canned_edit = json.dumps(
+            {
+                "title": "테스트 제목",
+                "content": "## 소제목\n\n테스트 본문이다.",
+                "excerpt": "테스트 요약문이다.",
+                "editor_note": "## 한국 시장 전망\n\n일반적 전망만 제시한다.",
+            },
+            ensure_ascii=False,
+        )
+        self.captured_prompts.clear()
+
+        def fake_call_api_edit(_self, prompt, max_tokens=8192, response_mime_type=None):
+            self.captured_prompts.append(prompt)
+            return canned_edit
+
+        with mock.patch.object(tpp.GeminiEngine, "_call_api", fake_call_api_edit):
+            result = self.engine.edit_article("테스트 제목", "테스트 본문이다.", "테스트 요약문이다.")
+        self.assertEqual(result["editor_note"], "## 한국 시장 전망\n\n일반적 전망만 제시한다.")
+        self.assertEqual(len(self.captured_prompts), 1)
+        prompt = self.captured_prompts[0]
+        for required in (
+            "일반적 전망만",
+            "원문 사실은 일본의 사실로",
+            "원문에 없는 한국 사실을 만들어내지 말 것",
+        ):
+            self.assertIn(required, prompt, f"missing from edit prompt: {required}")
+        for forbidden in (
+            "국내에서는 이미 유사한 시도가 있었으며",
+            "국토교통부의 드론 규제 완화 흐름",
+            "한국 규제·정책 환경과의 연관성",
+        ):
+            self.assertNotIn(forbidden, prompt, f"must be gone from edit prompt: {forbidden}")
+
 
 if __name__ == "__main__":
     unittest.main()
